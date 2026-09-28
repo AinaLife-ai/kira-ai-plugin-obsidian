@@ -34,5 +34,35 @@
     "name": "结果最大字符数",
     "default": 8000,
     "hint": "note_list/note_read 等结果超出该字符数会截断并标注。"
+  },
+  "plan_file": {
+    "type": "string",
+    "name": "学习计划文件",
+    "default": "学习计划.md",
+    "hint": "学习日程/打卡/复盘使用的计划笔记文件名（相对 vault 根目录，可直接用 Gantt Calendar / Tasks 插件打开）。"
+  },
+  "push_sid": {
+    "type": "string",
+    "name": "主动提醒会话",
+    "default": "",
+    "hint": "定时提醒推送到哪个会话，如 qq:dm:123456（私聊）或 qq:gm:123456789（群）。留空则不做主动推送，只保留工具调用。"
+  },
+  "reminder_enabled": {
+    "type": "switch",
+    "name": "启用定时提醒",
+    "default": false,
+    "hint": "开启动态按计划时间提醒即将开始的学习任务，并在每天 report_time 推送进度复盘。需同时填写 push_sid。"
+  },
+  "remind_before_minutes": {
+    "type": "integer",
+    "name": "提前提醒分钟数",
+    "default": 10,
+    "hint": "任务开始前多少分钟提醒（0 表示只提醒已到点的任务）。"
+  },
+  "report_time": {
+    "type": "string",
+    "name": "每日复盘时间",
+    "default": "21:00",
+    "hint": "每天这个时间自动检查学习计划并推送进度报告（24 小时制 HH:MM）。留空不推送复盘。"
   }
 }
