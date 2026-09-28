@@ -1,17 +1,17 @@
 {
-  "display_name": "Obsidian 笔记工具",
+  "display_name": "Obsidian 笔记工具（含学习监督扩展）",
   "plugin_id": "kira-ai-plugin-obsidian",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "core_version": ">=2.31.0",
-  "author": "skyzhishui",
-  "description": "Obsidian 笔记工具集：搜索/列出/读取/新建/追加/局部修改/删除 Obsidian 笔记（经 Obsidian Local REST API 社区插件操作 vault）",
-  "tags": ["notes", "utility"],
-  "repo": "https://github.com/skyzhishui/kira-ai-plugin-obsidian",
+  "author": "skyzhishui / ainali",
+  "description": "Obsidian 笔记工具集：搜索/列出/读取/新建/追加/局部修改/删除笔记（经 Local REST API），并内置学习监督扩展：study_schedule 自动排学习计划（Gantt Calendar 格式）、study_checkin 打卡、study_report 复盘顺延、定时提醒与每日进度推送。",
+  "tags": ["notes", "utility", "study", "schedule"],
+  "repo": "https://github.com/AinaLife-ai/kira-ai-plugin-obsidian",
   "icon": "icon.svg",
   "locales": {
     "en": {
-      "display_name": "Obsidian Notes",
-      "description": "Obsidian note tools: search/list/read/create/append/patch/delete notes in a vault via the Obsidian Local REST API community plugin."
+      "display_name": "Obsidian Notes + Study",
+      "description": "Obsidian note tools via Local REST API, plus study schedule: plan tasks (Gantt Calendar format), checkin, progress report with auto-defer, timed reminders."
     }
   }
 }
