@@ -24,16 +24,103 @@ frontmatter 解析、markdown 结构解析、搜索打分均由 Obsidian 侧完�
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import urllib.parse
+from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Any
 
 from core.plugin import BasePlugin, logger, register
+from core.chat import MessageChain
+from core.chat.message_elements import Text
 
 from .client import ObsidianClient
 
 _ACCEPT_METADATA = "application/vnd.olrapi.note+json"
 _ACCEPT_STRUCTURE = "application/vnd.olrapi.document-map+json"
+
+# ---------------------------------------------------------------------------
+# Study schedule extension (v1.1.0): Gantt Calendar compatible task helpers
+# ---------------------------------------------------------------------------
+
+_PRIO_EMOJI = {
+    "highest": "🔺",
+    "high": "⏫",
+    "medium": "🔼",
+    "low": "🔽",
+    "lowest": "⏬",
+}
+_PRIO_NAMES = {v: k for k, v in _PRIO_EMOJI.items()}
+
+_TASK_LINE_RE = re.compile(
+    r"^- \[([ xX])\] (.+?)(?: (🔺|⏫|🔼|🔽|⏬))?"
+    r"(?: .*?🛫 (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?))?"
+    r"(?: .*?📅 (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?))?"
+    r"(?: .*?✅ (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?))?$"
+)
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _is_date_only(s: str) -> bool:
+    return bool(s) and len(s.strip()) == 10
+
+
+def _is_overdue(deadline: str | None, now: datetime) -> bool:
+    dt = _parse_dt(deadline)
+    if dt is None:
+        return False
+    if _is_date_only(deadline):
+        return dt.date() < now.date()
+    return dt < now
+
+
+def _shift_date_str(s: str | None, days: int) -> str | None:
+    dt = _parse_dt(s)
+    if dt is None:
+        return s
+    nd = dt + timedelta(days=days)
+    if _is_date_only(s):
+        return nd.strftime("%Y-%m-%d")
+    return nd.strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_task_line(line: str) -> dict | None:
+    m = _TASK_LINE_RE.match(line.strip())
+    if not m:
+        return None
+    done, desc, prio, start, due, comp = m.groups()
+    return {
+        "done": done.lower() == "x",
+        "desc": desc.strip(),
+        "prio": _PRIO_NAMES.get(prio, "normal") if prio else "normal",
+        "start": start,
+        "due": due,
+        "comp": comp,
+    }
+
+
+def _make_task_line(desc: str, start: str, due: str, prio: str = "normal") -> str:
+    parts = [f"- [ ] {desc.strip()}"]
+    if prio and prio != "normal":
+        parts.append(_PRIO_EMOJI.get(prio, ""))
+    if start:
+        parts.append(f"🛫 {start}")
+    if due:
+        parts.append(f"📅 {due}")
+    return " ".join(p for p in parts if p)
 
 _NOT_CONFIGURED = (
     "错误：Obsidian 笔记工具未配置。请在本插件配置中填写 base_url"
@@ -111,6 +198,18 @@ class ObsidianPlugin(BasePlugin):
         self._max_output = 8000
         self._max_results = 8
         self._summary_len = 150
+        # --- study schedule extension (v1.1.0) ---
+        self.plan_file = str(self.plugin_cfg.get("plan_file", "") or "").strip()
+        self.push_sid = str(self.plugin_cfg.get("push_sid", "") or "").strip()
+        self.reminder_enabled = bool(self.plugin_cfg.get("reminder_enabled", False))
+        self.remind_before_minutes = max(
+            int(self.plugin_cfg.get("remind_before_minutes", 10) or 10), 0
+        )
+        self.report_time = str(self.plugin_cfg.get("report_time", "") or "").strip()
+        self._study_task: asyncio.Task | None = None
+        self._reminded: set[str] = set()
+        self._reported_date: str = ""
+        self._state_path = None
 
     async def initialize(self):
         """按插件配置构造客户端（支持热重载重入；失败降级为未配置）。"""
@@ -132,11 +231,26 @@ class ObsidianPlugin(BasePlugin):
             self._max_results = _as_int(self.plugin_cfg.get("max_results"), 8)
             self._summary_len = _as_int(self.plugin_cfg.get("summary_max_length"), 150)
             logger.info("Obsidian: 笔记工具已就绪（base_url=%s，共 7 个工具）", base_url)
+            if self.reminder_enabled and self.plan_file:
+                self._state_path = Path(self.ctx.get_plugin_data_dir()) / "study_state.json"
+                self._load_study_state()
+                if self._study_task is None or self._study_task.done():
+                    self._study_task = asyncio.create_task(self._study_loop())
+                    logger.info("Obsidian: 学习监督定时任务已启动 (plan=%s)", self.plan_file)
         except Exception:
             logger.exception("Obsidian: 配置解析失败，笔记工具降级为不可用")
             self._client = None
 
     async def terminate(self):
+        if self._study_task and not self._study_task.done():
+            self._study_task.cancel()
+            try:
+                await self._study_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Obsidian: 学习监督任务退出异常")
+        self._study_task = None
         self._client = None
 
     def _require_client(self) -> ObsidianClient | None:
@@ -521,3 +635,335 @@ class ObsidianPlugin(BasePlugin):
                 lines.append(f"{i}. {filename} | {summary}")
         lines.append("提示: 用 note_read 查看完整笔记内容")
         return _truncate("\n".join(lines), self._max_output)
+
+    # ------------------------------------------------------------------
+    # Study schedule extension (v1.1.0): 学习计划 / 打卡 / 复盘 + 定时提醒
+    # ------------------------------------------------------------------
+
+    async def _vault_read(self, path: str) -> str | None:
+        """Read a vault file; empty string means file missing, None means error."""
+        if self._client is None:
+            return None
+        r = await self._client.request("GET", f"/vault/{path}")
+        if isinstance(r, dict) and r.get("error"):
+            if "404" in str(r["error"]):
+                return ""
+            return None
+        return str(r) if r is not None else ""
+
+    async def _vault_write(self, path: str, content: str) -> str | None:
+        """Write a vault file; returns error text or None on success."""
+        if self._client is None:
+            return "Obsidian 未配置"
+        r = await self._client.request("PUT", f"/vault/{path}", body=content)
+        if isinstance(r, dict) and r.get("error"):
+            return str(r["error"])
+        return None
+
+    def _load_study_state(self):
+        try:
+            if self._state_path and self._state_path.exists():
+                st = json.loads(self._state_path.read_text("utf-8"))
+                self._reminded = set(st.get("reminded", []))
+                self._reported_date = str(st.get("reported_date", ""))
+        except Exception:
+            logger.exception("Obsidian: 学习状态读取失败")
+
+    def _save_study_state(self):
+        try:
+            if self._state_path:
+                self._state_path.parent.mkdir(parents=True, exist_ok=True)
+                self._state_path.write_text(
+                    json.dumps(
+                        {"reminded": sorted(self._reminded), "reported_date": self._reported_date},
+                        ensure_ascii=False,
+                    ),
+                    "utf-8",
+                )
+        except Exception:
+            logger.exception("Obsidian: 学习状态保存失败")
+
+    async def _study_notify(self, text: str):
+        """Push a proactive notice to the configured sid."""
+        if not self.push_sid:
+            return
+        try:
+            await self.ctx.publish_notice(
+                self.push_sid, MessageChain([Text(text)]), is_mentioned=True
+            )
+        except Exception:
+            logger.exception("Obsidian: 学习提醒推送失败")
+
+    async def _study_loop(self):
+        while True:
+            try:
+                await self._study_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Obsidian: 学习监督 tick 异常")
+            await asyncio.sleep(60)
+
+    async def _study_tick(self):
+        if self._client is None:
+            return
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        content = await self._vault_read(self.plan_file)
+        if content is None:
+            return
+        # 1) remind tasks that are about to start
+        if self.remind_before_minutes and content:
+            window_end = now + timedelta(minutes=self.remind_before_minutes)
+            for line in content.splitlines():
+                t = _parse_task_line(line)
+                if not t or t["done"]:
+                    continue
+                sd = _parse_dt(t["start"])
+                if not sd or not (now <= sd <= window_end):
+                    continue
+                key = f"{today}|{line.strip()}"
+                if key in self._reminded:
+                    continue
+                self._reminded.add(key)
+                self._save_study_state()
+                await self._study_notify(
+                    f"⏰ 学习提醒：{t['desc']} 该开始了（{t['start']}）"
+                )
+        # 2) daily progress report at report_time
+        if (
+            self.report_time
+            and now.strftime("%H:%M") == self.report_time
+            and self._reported_date != today
+        ):
+            self._reported_date = today
+            self._save_study_state()
+            report = await self.study_report(None, plan_file=self.plan_file)
+            await self._study_notify(report)
+
+    @register.tool(
+        name="study_schedule",
+        description="把学习任务排进 Obsidian 计划笔记（Gantt Calendar Tasks 格式；同文件里今天已存在的任务行会被清理，避免重复堆积）。用户说'安排学习计划/排任务/制定学习日程'时调用。",
+        params={
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "string",
+                    "description": "任务列表，每行一条，格式：描述 | 开始时间 | 截止时间 | 优先级。时间支持 YYYY-MM-DD 或 YYYY-MM-DD HH:mm；优先级可选 highest/high/medium/low/lowest（默认 normal）。示例：\n复习高数第三章 | 2026-09-28 09:00 | 2026-09-28 11:00 | high\n背单词50个 | 2026-09-28 14:00 | 2026-09-28 15:00 | medium",
+                },
+                "plan_file": {
+                    "type": "string",
+                    "description": "计划笔记文件名（默认为插件配置里的 plan_file）",
+                },
+            },
+            "required": ["tasks"],
+        },
+    )
+    async def study_schedule(self, event, *_, tasks: str = "", plan_file: str = "", **_kwargs) -> str:
+        if self._client is None:
+            return _NOT_CONFIGURED
+        path = (plan_file or self.plan_file or "学习计划.md").strip().strip("/")
+        if not tasks.strip():
+            return "错误：缺少 tasks 参数"
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        content = await self._vault_read(path)
+        if content is None:
+            return "错误：读取计划文件失败，请检查 Obsidian 连接"
+        # keep non-task lines and tasks whose due date is not today
+        kept: list[str] = []
+        removed = 0
+        for line in content.splitlines():
+            t = _parse_task_line(line)
+            if t is None:
+                kept.append(line)
+                continue
+            due_dt = _parse_dt(t["due"])
+            if due_dt and due_dt.strftime("%Y-%m-%d") == today:
+                removed += 1
+                continue
+            kept.append(line)
+        while kept and kept[-1].strip() == "":
+            kept.pop()
+        # build new task lines
+        new_lines: list[str] = []
+        for raw in tasks.strip().splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            parts = [p.strip() for p in re.split(r"\s*\|\s*", raw)]
+            desc = parts[0]
+            start = parts[1] if len(parts) > 1 else ""
+            due = parts[2] if len(parts) > 2 else (start or today)
+            prio = parts[3] if len(parts) > 3 else "normal"
+            if not desc:
+                continue
+            if prio not in _PRIO_EMOJI:
+                prio = "normal"
+            if start and not _parse_dt(start):
+                return f"错误：开始时间格式不对（{start}），应形如 2026-09-28 或 2026-09-28 18:00"
+            if not _parse_dt(due):
+                return f"错误：截止时间格式不对（{due}），应形如 2026-09-28 或 2026-09-28 18:00"
+            new_lines.append(_make_task_line(desc, start, due, prio))
+        if not new_lines:
+            return "错误：没有解析出有效任务"
+        updated = "\n".join(kept + new_lines).rstrip() + "\n"
+        err = await self._vault_write(path, updated)
+        if err:
+            return f"写入失败：{err}"
+        summary = "\n".join(l[5:] for l in new_lines)
+        return (
+            f"已安排 {len(new_lines)} 个学习任务到 {path}"
+            f"（今日旧任务清理 {removed} 条）：\n{summary}"
+        )
+
+    @register.tool(
+        name="study_checkin",
+        description="学习打卡：把计划笔记里匹配关键词的未完成任务标记为已完成（[x] 并追加 ✅ 完成日期）。用户说'我学完了XX/打卡/标记完成'时调用。",
+        params={
+            "type": "object",
+            "properties": {
+                "task_keyword": {
+                    "type": "string",
+                    "description": "要标记完成的任务描述关键词（模糊匹配）",
+                },
+                "done_date": {
+                    "type": "string",
+                    "description": "完成日期 YYYY-MM-DD（默认今天）",
+                },
+                "plan_file": {
+                    "type": "string",
+                    "description": "计划笔记文件名（默认为插件配置里的 plan_file）",
+                },
+            },
+            "required": ["task_keyword"],
+        },
+    )
+    async def study_checkin(self, event, *_, task_keyword: str = "", done_date: str = "",
+                            plan_file: str = "", **_kwargs) -> str:
+        if self._client is None:
+            return _NOT_CONFIGURED
+        if not task_keyword.strip():
+            return "错误：缺少 task_keyword 参数"
+        path = (plan_file or self.plan_file or "学习计划.md").strip().strip("/")
+        done = done_date or datetime.now().strftime("%Y-%m-%d")
+        content = await self._vault_read(path)
+        if content is None:
+            return "错误：读取计划文件失败"
+        if not content:
+            return "计划文件为空，先 study_schedule 安排任务"
+        kw = task_keyword.strip().lower()
+        out: list[str] = []
+        matched = False
+        updated_line = ""
+        candidates: list[str] = []
+        for line in content.splitlines():
+            t = _parse_task_line(line)
+            if t is None:
+                out.append(line)
+                continue
+            hit = kw in t["desc"].lower()
+            if hit:
+                candidates.append(line.strip())
+            if t["done"]:
+                out.append(line)
+                continue
+            if hit and not matched:
+                base = re.sub(r"^- \[[ xX]\]", "- [x]", line, count=1).rstrip()
+                if not re.search(r"✅ \d{4}-\d{2}-\d{2}", base):
+                    base = f"{base} ✅ {done}"
+                out.append(base)
+                matched = True
+                updated_line = base.strip()
+                continue
+            out.append(line)
+        if not matched:
+            tip = "\n".join(candidates[:5]) if candidates else "（没有相近任务）"
+            return (
+                f"没找到未完成的匹配任务：{task_keyword}\n"
+                f"相近任务：\n{tip}\n"
+                "试试更短的关键词，或先 study_schedule 安排任务"
+            )
+        err = await self._vault_write(path, "\n".join(out).rstrip() + "\n")
+        if err:
+            return f"写入失败：{err}"
+        return f"✅ 打卡成功：{updated_line[5:]}"
+
+    @register.tool(
+        name="study_report",
+        description="检查学习进度并动态调整：统计完成率、今日截止情况和过期任务，把过期未完成的任务顺延到明天。用户说'检查学习进度/今日复盘/学习状态'时调用。",
+        params={
+            "type": "object",
+            "properties": {
+                "plan_file": {
+                    "type": "string",
+                    "description": "计划笔记文件名（默认为插件配置里的 plan_file）",
+                },
+                "adjust": {
+                    "type": "boolean",
+                    "description": "是否把过期未完成任务顺延到明天（默认 true）",
+                },
+            },
+        },
+    )
+    async def study_report(self, event, *_, plan_file: str = "", adjust: bool = True, **_kwargs) -> str:
+        if self._client is None:
+            return _NOT_CONFIGURED
+        path = (plan_file or self.plan_file or "学习计划.md").strip().strip("/")
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        content = await self._vault_read(path)
+        if content is None:
+            return "错误：读取计划文件失败"
+        if not content:
+            return "计划文件为空，还没有任务"
+        total = done = 0
+        today_due = 0
+        today_done = 0
+        overdue = 0
+        shifted = 0
+        out: list[str] = []
+        for line in content.splitlines():
+            t = _parse_task_line(line)
+            if t is None:
+                out.append(line)
+                continue
+            total += 1
+            due_dt = _parse_dt(t["due"])
+            due_today = bool(due_dt and due_dt.strftime("%Y-%m-%d") == today)
+            if due_today:
+                today_due += 1
+            if t["done"]:
+                done += 1
+                if due_today:
+                    today_done += 1
+                out.append(line)
+                continue
+            if _is_overdue(t["due"], now):
+                overdue += 1
+                if adjust:
+                    new_due = _shift_date_str(t["due"], 1)
+                    new_start = _shift_date_str(t["start"], 1) if t["start"] else ""
+                    out.append(_make_task_line(t["desc"], new_start, new_due or "", t["prio"]))
+                    shifted += 1
+                    continue
+            out.append(line)
+        if shifted:
+            err = await self._vault_write(path, "\n".join(out).rstrip() + "\n")
+            if err:
+                return f"统计完成但写回失败：{err}"
+        rate = f"{done}/{total}（{done * 100 // total if total else 0}%）" if total else "0/0"
+        lines = [
+            f"📊 学习进度 {today}",
+            f"任务总数：{total}　已完成：{rate}",
+            f"今日截止：{today_due}（已完成 {today_done}）　过期未完成：{overdue}",
+        ]
+        if shifted:
+            lines.append(f"↪️ 已把 {shifted} 个过期任务顺延到明天")
+        if total and done == total:
+            lines.append("🎉 全部完成，可以加量或休息")
+        elif total and done >= total * 0.7:
+            lines.append("👍 进度不错，保持节奏")
+        elif overdue:
+            lines.append("⚠️ 有任务积压，建议砍掉部分任务或降低强度")
+        return "\n".join(lines)
